@@ -22,10 +22,9 @@ import kotlin.test.assertTrue
  *
  * [PluginStoreClient.checkHealth] answers `false` from `catch (_: Exception)`, and on the JVM a
  * `CancellationException` is an `Exception`, so a caller cancelled mid-request was told the store is
- * unavailable. That answer outlives the cancellation: `RemotePluginRepository.isAvailable` and
- * `PluginStoreSetup`'s readiness check both key off it, so closing a dialog could mark a healthy
- * store offline. It is the same family as the six store calls in #531, at the one site that returns a
- * bare `Boolean` rather than a `Result`, which is why it needed its own change.
+ * unavailable. This test observes the client's own return value before an outer coroutine boundary
+ * can rethrow cancellation. Repository availability depends on configuration, not this response.
+ * Unlike the six Result-returning store calls in #531, this site returns a bare Boolean.
  *
  * Driven against a real local server that receives the request and holds it, so the cancellation
  * lands inside the ktor call rather than in a fake. A positive control proves the assertion can see
