@@ -34,6 +34,7 @@ class PluginStoreHealthCancellationTest {
     private lateinit var server: HttpServer
     private lateinit var received: CountDownLatch
     private lateinit var release: CountDownLatch
+    // Writes precede release.countDown(); the handler reads after release.await().
     private var status = 200
 
     @BeforeTest
@@ -43,8 +44,8 @@ class PluginStoreHealthCancellationTest {
         status = 200
         server =
             HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
-                // The JDK dispatches handlers on its own thread when no executor is passed, so
-                // blocking here does not stall the test's own threads.
+                // The JDK uses one dispatcher thread without an executor. Each test sends
+                // one request; holding it does not block the test thread.
                 createContext("/") { exchange ->
                     received.countDown()
                     release.await(10, TimeUnit.SECONDS)
@@ -93,6 +94,17 @@ class PluginStoreHealthCancellationTest {
             )
         }
     }
+
+    @Test
+    fun `a healthy store still answers true`() =
+        runBlocking {
+            release.countDown()
+
+            val healthy = PluginStoreClient.checkHealth()
+
+            assertTrue(received.await(10, TimeUnit.SECONDS), "the store never received the request")
+            assertTrue(healthy, "a 200 must still read as healthy")
+        }
 
     @Test
     fun `a store that is really down still answers false`() =
