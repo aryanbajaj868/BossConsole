@@ -223,7 +223,7 @@ object PluginStoreClient {
      *
      * Answers `false` for anything that stops the request from succeeding, because every caller
      * wants one bit and has nothing useful to do with the reason. A caller's cancellation is the
-     * one exception and is rethrown: on the JVM `CancellationException` is an `Exception`, so it
+     * one exception (including a caller's coroutine timeout) and is rethrown: on the JVM `CancellationException` is an `Exception`, so it
      * used to be caught here and answered as "the store is down". Propagating it preserves the
      * caller's cancellation contract rather than returning a health verdict for an aborted request.
      * Repository availability currently depends on configuration, not this response. The repository
