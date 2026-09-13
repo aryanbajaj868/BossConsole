@@ -34,6 +34,7 @@ class PluginStoreHealthCancellationTest {
     private lateinit var server: HttpServer
     private lateinit var received: CountDownLatch
     private lateinit var release: CountDownLatch
+
     // Writes precede release.countDown(); the handler reads after release.await().
     private var status = 200
 
