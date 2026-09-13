@@ -216,11 +216,11 @@ object PluginStoreClient {
      * Answers `false` for anything that stops the request from succeeding, because every caller
      * wants one bit and has nothing useful to do with the reason. A caller's cancellation is the
      * one exception and is rethrown: on the JVM `CancellationException` is an `Exception`, so it
-     * used to be caught here and answered as "the store is down" - an answer that outlives the
-     * cancelled caller, since `RemotePluginRepository.isAvailable` and the readiness check in
-     * `PluginStoreSetup` both key off it. Closing a dialog mid-check could mark a healthy store
-     * offline. Same rule the six store calls in RemotePluginRepository take, at the one site that
-     * returns a bare `Boolean` rather than a `Result`.
+     * used to be caught here and answered as "the store is down". Propagating it preserves the
+     * caller's cancellation contract rather than returning a health verdict for an aborted request.
+     * Repository availability currently depends on configuration, not this response. The repository
+     * wrapper also uses withContext, which independently checks cancellation when dispatching back.
+     * This guard makes the client's own contract correct, including for direct callers.
      */
     suspend fun checkHealth(): Boolean =
         try {
