@@ -80,8 +80,11 @@ import java.io.File
  * This file is automatically created and managed by this service.
  */
 object UserDataStorage {
-    private val storageFile = BossDirectories.resolve("user_data.json")
-    private val pendingWizardCompletedFile = BossDirectories.resolve("pending_wizard_completed")
+    /** Redirected by [resetForTesting] for hermetic unit tests; production code never reassigns it. */
+    internal var storageFile: File = BossDirectories.resolve("user_data.json")
+
+    /** Same redirect as [storageFile]; the two files always live in the same directory. */
+    internal var pendingWizardCompletedFile: File = BossDirectories.resolve("pending_wizard_completed")
     private val json =
         Json {
             ignoreUnknownKeys = true
@@ -113,6 +116,16 @@ object UserDataStorage {
     init {
         // Ensure directory exists
         storageFile.parentFile?.mkdirs()
+    }
+
+    /**
+     * Point both files at [testDir] for hermetic unit testing. Tests must call this again with
+     * the real directory (e.g. [BossDirectories.rootDir]) before finishing, so the singleton is
+     * left where the app and other tests expect it.
+     */
+    internal fun resetForTesting(testDir: File) {
+        storageFile = testDir.resolve("user_data.json")
+        pendingWizardCompletedFile = testDir.resolve("pending_wizard_completed")
     }
 
     /**
@@ -312,7 +325,12 @@ object UserDataStorage {
      * Mark the plugin installation wizard as completed for this user.
      *
      * If user_data.json doesn't exist yet (user not logged in), stores the setting
-     * in a separate file that will be merged when the user logs in.
+     * in a separate file that will be merged when the user logs in. If the file exists but is
+     * undecodable - the torn state a pre-atomic-write `writeText` left on existing installs -
+     * the flag goes to that same pending marker: there is no record to copy it into, and none
+     * can be fabricated without the user's identity; [saveUserData] merges the marker into a
+     * fresh, whole record on the next login. Without the fallback the wizard would re-run on
+     * every launch for exactly the installs issue #762 is about.
      */
     suspend fun setPluginWizardCompleted(completed: Boolean) {
         withContext(Dispatchers.IO) {
@@ -320,19 +338,31 @@ object UserDataStorage {
                 try {
                     if (storageFile.exists()) {
                         val content = storageFile.readText()
-                        val data = json.decodeFromString<StoredUserData>(content)
-                        val updatedData = data.copy(pluginWizardCompleted = completed)
-                        // Atomic, and under the lock: read and write are one step, so a
-                        // saveUserData landing in between cannot have its record overwritten by
-                        // this copy of the older one.
-                        storageFile.atomicWriteText(json.encodeToString(updatedData))
-                        logger.debug(
-                            LogCategory.AUTH,
-                            "Updated plugin wizard completion status",
-                            mapOf(
-                                "completed" to completed,
-                            ),
-                        )
+                        try {
+                            val data = json.decodeFromString<StoredUserData>(content)
+                            val updatedData = data.copy(pluginWizardCompleted = completed)
+                            // Atomic, and under the lock: read and write are one step, so a
+                            // saveUserData landing in between cannot have its record
+                            // overwritten by this copy of the older one.
+                            storageFile.atomicWriteText(json.encodeToString(updatedData))
+                            logger.debug(
+                                LogCategory.AUTH,
+                                "Updated plugin wizard completion status",
+                                mapOf(
+                                    "completed" to completed,
+                                ),
+                            )
+                        } catch (e: kotlinx.serialization.SerializationException) {
+                            // An existing but torn record: the flag has nowhere to go inside it,
+                            // so persist it via the pending marker (the pre-login path). The
+                            // next saveUserData merges the marker into a fresh, whole record.
+                            logger.warn(
+                                LogCategory.AUTH,
+                                "user_data.json undecodable; persisting wizard status via pending marker",
+                                error = e,
+                            )
+                            pendingWizardCompletedFile.atomicWriteText(completed.toString())
+                        }
                     } else {
                         // File doesn't exist yet - store in a temporary pending file
                         // This will be merged when saveUserData is called

@@ -56,7 +56,12 @@ data class RecentFilesData(
 object RecentFilesManager {
     private const val MAX_FILES = 20
     private const val SAVE_DEBOUNCE_MS = 5000L // Debounce saves to max once per 5 seconds
-    private val settingsFile = BossDirectories.resolve("recent-files.json")
+
+    /**
+     * Redirected by [resetForTesting] for hermetic unit tests; production code never reassigns
+     * it, the same way the sibling [RecentBrowserPagesManager] does.
+     */
+    internal var settingsFile: File = BossDirectories.resolve("recent-files.json")
     private val json =
         Json {
             prettyPrint = false
@@ -111,10 +116,13 @@ object RecentFilesManager {
     }
 
     /**
-     * Apply [transform] to the recorded list under [mutationLock] and schedule a save.
+     * Apply [transform] to the recorded list under [mutationLock] and schedule a save if the
+     * list changed.
      *
-     * The single entry point for mutation, so no caller can reintroduce the read-then-write race
-     * by touching [setFiles] directly.
+     * The single entry point for user-driven mutation, so no caller can reintroduce the
+     * read-then-write race by touching [setFiles] directly. The startup merge is the one other
+     * path that holds [mutationLock]: its no-op baseline is the decoded file rather than the
+     * pre-merge list, so it decides its own save (see [loadAsync]).
      */
     private suspend fun mutate(transform: (List<RecentFile>) -> List<RecentFile>) {
         val changed =
@@ -128,25 +136,45 @@ object RecentFilesManager {
                     true
                 }
             }
-        // A transform that changed nothing schedules nothing: the startup merge is usually a
-        // no-op, and without this every launch would rewrite recent-files.json with its own
-        // contents. RecentFile is a data class, so this is a value comparison.
+        // A transform that changed nothing schedules nothing. RecentFile is a data class, so
+        // this is a value comparison.
         if (changed) scheduleSave()
     }
 
+    /**
+     * Retained so [resetForTesting] can cancel it: the init load reads [settingsFile] at
+     * execution time, and a test that re-points the file must not have the first load merge
+     * the real user's list into its hermetic state.
+     */
+    private var initialLoadJob: Job? = null
+
     init {
-        scope.launch {
-            loadAsync()
-        }
+        initialLoadJob =
+            scope.launch {
+                loadAsync()
+            }
     }
 
     /**
      * Load recent files from disk asynchronously.
+     *
+     * Returns whether the startup merge changed what is on disk, i.e. whether a save was
+     * scheduled. The no-op baseline is the decoded contents, not the pre-merge in-memory list:
+     * that list is empty until this point, so comparing the merge against it would call the
+     * ordinary launch "changed" and rewrite recent-files.json with its own contents on every
+     * start.
+     *
+     * Known limitation: the read and decode run before [mutationLock] is taken, so a
+     * `removeFile` or `clearAll` landing inside that window (milliseconds, at launch) is
+     * applied first, and the merge then reapplies the stale decoded contents until the next
+     * real mutation. Re-reading the file under the lock would close the window, but a slow
+     * disk would then hold the mutation lock for the whole read, which is the worse trade.
      */
-    private suspend fun loadAsync() =
+    internal suspend fun loadAsync(): Boolean =
         withContext(Dispatchers.IO) {
+            var persist = false
             try {
-                if (!settingsFile.exists()) return@withContext
+                if (!settingsFile.exists()) return@withContext false
 
                 val content = settingsFile.readText()
                 val data = json.decodeFromString<RecentFilesData>(content)
@@ -160,7 +188,13 @@ object RecentFilesManager {
                 // open an empty editor - fileExists existed for exactly this and had no callers)
                 // but stays in the recorded list, so an unmounted volume coming back brings its
                 // entries with it. See _allFiles.
-                mutate { recorded -> mergeRecorded(loaded = data.files, recorded = recorded, max = MAX_FILES) }
+                persist =
+                    mutationLock.withLock {
+                        val after = mergeRecorded(loaded = data.files, recorded = _allFiles.value, max = MAX_FILES)
+                        if (after != _allFiles.value) setFiles(after)
+                        after != data.files
+                    }
+                if (persist) scheduleSave()
 
                 val present = _recentFiles.value
                 recentFilesLogger.debug(
@@ -171,7 +205,38 @@ object RecentFilesManager {
             } catch (e: Exception) {
                 recentFilesLogger.warn(LogCategory.FILE, "Error loading recent files", error = e)
             }
+            persist
         }
+
+    /**
+     * Reset manager state for hermetic unit testing and redirect [settingsFile] to [testFile].
+     * Cancels the init load (it reads [settingsFile] at execution time) and any pending
+     * debounced save, clears both flows, and re-runs the load so the state matches [testFile].
+     * When [recorded] is given it is seeded after the load, so a test can observe the startup
+     * merge against a non-empty "recorded while the load was in flight" state.
+     * Tests must call this again with the real path before finishing, so the singleton is left
+     * where the app and other tests expect it.
+     */
+    internal suspend fun resetForTesting(
+        testFile: File,
+        recorded: List<RecentFile>? = null,
+    ) {
+        initialLoadJob?.cancel()
+        initialLoadJob = null
+        mutationLock.withLock {
+            settingsFile = testFile
+            _allFiles.value = emptyList()
+            _recentFiles.value = emptyList()
+        }
+        synchronized(saveJobLock) {
+            saveJob?.cancel()
+            saveJob = null
+        }
+        loadAsync()
+        if (recorded != null) {
+            mutationLock.withLock { setFiles(recorded) }
+        }
+    }
 
     /**
      * Save recent files to disk with debouncing.
