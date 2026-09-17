@@ -2,10 +2,13 @@ package ai.rever.boss.services.auth
 
 import ai.rever.boss.plugin.pathutils.BossDirectories
 import ai.rever.boss.services.supabase.models.UserInfo
+import ai.rever.boss.utils.atomicWriteText
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.logging.LogSanitizer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -86,6 +89,18 @@ object UserDataStorage {
         }
     private val logger = BossLogger.forComponent("UserDataStorage")
 
+    /**
+     * Serialises every read-modify-write of [storageFile].
+     *
+     * `saveUserData` and `setPluginWizardCompleted` both read the file, edit one field, and write
+     * the whole record back. Nothing coordinated them, and both are reachable at once: the plugin
+     * wizard can finish while a session restore is saving user data, and the loser's field is
+     * silently reverted - the wizard re-runs on the next launch because `pluginWizardCompleted`
+     * went back to false. `clearUserData` takes the lock too, so logout cannot delete the file
+     * between another writer's read and its write and have that writer recreate it.
+     */
+    private val fileLock = Mutex()
+
     @Serializable
     data class StoredUserData(
         val id: String,
@@ -101,6 +116,43 @@ object UserDataStorage {
     }
 
     /**
+     * The wizard-completed marker written before the user logged in, or false if it is absent or
+     * unreadable. Call while holding [fileLock].
+     */
+    private fun readPendingWizardFlag(): Boolean {
+        if (!pendingWizardCompletedFile.exists()) return false
+        return try {
+            pendingWizardCompletedFile.readText().trim().toBoolean()
+        } catch (e: Exception) {
+            logger.debug(
+                LogCategory.AUTH,
+                "Could not read pending wizard-completed marker - assuming false",
+                mapOf("error" to e.toString()),
+            )
+            false
+        }
+    }
+
+    /**
+     * The wizard-completed flag already in [storageFile], or false if it is absent or unreadable.
+     * Read so that saving user data preserves it rather than resetting it. Call while holding
+     * [fileLock].
+     */
+    private fun readStoredWizardFlag(): Boolean {
+        if (!storageFile.exists()) return false
+        return try {
+            json.decodeFromString<StoredUserData>(storageFile.readText()).pluginWizardCompleted
+        } catch (e: Exception) {
+            logger.debug(
+                LogCategory.AUTH,
+                "Could not read stored wizard status - assuming false",
+                mapOf("error" to e.toString()),
+            )
+            false
+        }
+    }
+
+    /**
      * Save user data to persistent storage
      *
      * Preserves the pluginWizardCompleted flag if it was previously set,
@@ -111,64 +163,38 @@ object UserDataStorage {
         authenticatedVia: String? = null,
     ) {
         withContext(Dispatchers.IO) {
-            try {
-                // Check for pending wizard completed status (set before login)
-                val pendingWizardCompleted =
-                    if (pendingWizardCompletedFile.exists()) {
-                        try {
-                            pendingWizardCompletedFile.readText().trim().toBoolean()
-                        } catch (e: Exception) {
-                            logger.debug(
-                                LogCategory.AUTH,
-                                "Could not read pending wizard-completed marker - assuming false",
-                                mapOf("error" to e.toString()),
-                            )
-                            false
-                        }
-                    } else {
-                        false
-                    }
+            fileLock.withLock {
+                try {
+                    // Either source being true means completed: the pending marker is written
+                    // before login, the stored flag after.
+                    val wizardCompleted = readPendingWizardFlag() || readStoredWizardFlag()
 
-                // Preserve existing pluginWizardCompleted status if file exists
-                val existingWizardCompleted =
-                    if (storageFile.exists()) {
-                        try {
-                            val existingContent = storageFile.readText()
-                            val existingData = json.decodeFromString<StoredUserData>(existingContent)
-                            existingData.pluginWizardCompleted
-                        } catch (e: Exception) {
-                            logger.debug(
-                                LogCategory.AUTH,
-                                "Could not read stored wizard status - assuming false",
-                                mapOf("error" to e.toString()),
-                            )
-                            false
-                        }
-                    } else {
-                        false
-                    }
-
-                // Use pending status OR existing status (either one being true means completed)
-                val wizardCompleted = pendingWizardCompleted || existingWizardCompleted
-
-                val data =
-                    StoredUserData(
-                        id = user.id,
-                        email = user.email,
-                        createdAt = user.createdAt,
-                        authenticatedVia = authenticatedVia,
-                        pluginWizardCompleted = wizardCompleted,
+                    val data =
+                        StoredUserData(
+                            id = user.id,
+                            email = user.email,
+                            createdAt = user.createdAt,
+                            authenticatedVia = authenticatedVia,
+                            pluginWizardCompleted = wizardCompleted,
+                        )
+                    val content = json.encodeToString(data)
+                    // Atomic: `writeText` truncates first, so a crash or a concurrent writer leaves a
+                    // half-written user_data.json. That parses as corrupt on the next launch, the user
+                    // is treated as logged out, and the plugin wizard runs again.
+                    storageFile.atomicWriteText(content)
+                    logger.debug(
+                        LogCategory.AUTH,
+                        "Saved user data",
+                        mapOf("email" to LogSanitizer.maskEmail(user.email)),
                     )
-                val content = json.encodeToString(data)
-                storageFile.writeText(content)
-                logger.debug(LogCategory.AUTH, "Saved user data", mapOf("email" to LogSanitizer.maskEmail(user.email)))
 
-                // Clean up pending file if it exists
-                if (pendingWizardCompletedFile.exists()) {
-                    pendingWizardCompletedFile.delete()
+                    // Clean up pending file if it exists
+                    if (pendingWizardCompletedFile.exists()) {
+                        pendingWizardCompletedFile.delete()
+                    }
+                } catch (e: Exception) {
+                    logger.error(LogCategory.AUTH, "Error saving user data", error = e)
                 }
-            } catch (e: Exception) {
-                logger.error(LogCategory.AUTH, "Error saving user data", error = e)
             }
         }
     }
@@ -210,13 +236,15 @@ object UserDataStorage {
      */
     suspend fun clearUserData() {
         withContext(Dispatchers.IO) {
-            try {
-                if (storageFile.exists()) {
-                    storageFile.delete()
-                    logger.debug(LogCategory.AUTH, "Cleared user data")
+            fileLock.withLock {
+                try {
+                    if (storageFile.exists()) {
+                        storageFile.delete()
+                        logger.debug(LogCategory.AUTH, "Cleared user data")
+                    }
+                } catch (e: Exception) {
+                    logger.error(LogCategory.AUTH, "Error clearing user data", error = e)
                 }
-            } catch (e: Exception) {
-                logger.error(LogCategory.AUTH, "Error clearing user data", error = e)
             }
         }
     }
@@ -288,27 +316,31 @@ object UserDataStorage {
      */
     suspend fun setPluginWizardCompleted(completed: Boolean) {
         withContext(Dispatchers.IO) {
-            try {
-                if (storageFile.exists()) {
-                    val content = storageFile.readText()
-                    val data = json.decodeFromString<StoredUserData>(content)
-                    val updatedData = data.copy(pluginWizardCompleted = completed)
-                    storageFile.writeText(json.encodeToString(updatedData))
-                    logger.debug(
-                        LogCategory.AUTH,
-                        "Updated plugin wizard completion status",
-                        mapOf(
-                            "completed" to completed,
-                        ),
-                    )
-                } else {
-                    // File doesn't exist yet - store in a temporary pending file
-                    // This will be merged when saveUserData is called
-                    pendingWizardCompletedFile.parentFile?.mkdirs()
-                    pendingWizardCompletedFile.writeText(completed.toString())
+            fileLock.withLock {
+                try {
+                    if (storageFile.exists()) {
+                        val content = storageFile.readText()
+                        val data = json.decodeFromString<StoredUserData>(content)
+                        val updatedData = data.copy(pluginWizardCompleted = completed)
+                        // Atomic, and under the lock: read and write are one step, so a
+                        // saveUserData landing in between cannot have its record overwritten by
+                        // this copy of the older one.
+                        storageFile.atomicWriteText(json.encodeToString(updatedData))
+                        logger.debug(
+                            LogCategory.AUTH,
+                            "Updated plugin wizard completion status",
+                            mapOf(
+                                "completed" to completed,
+                            ),
+                        )
+                    } else {
+                        // File doesn't exist yet - store in a temporary pending file
+                        // This will be merged when saveUserData is called
+                        pendingWizardCompletedFile.atomicWriteText(completed.toString())
+                    }
+                } catch (e: Exception) {
+                    logger.error(LogCategory.AUTH, "Error setting plugin wizard status", error = e)
                 }
-            } catch (e: Exception) {
-                logger.error(LogCategory.AUTH, "Error setting plugin wizard status", error = e)
             }
         }
     }
