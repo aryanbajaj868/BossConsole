@@ -232,19 +232,32 @@ object RecentFilesManager {
 
     /**
      * Reset manager state for hermetic unit testing and redirect [settingsFile] to [testFile].
-     * Cancels the init load (it reads [settingsFile] at execution time) and any pending
-     * debounced save, clears both flows, and re-runs the load so the state matches [testFile].
-     * When [recorded] is given it is seeded after the load, so a test can observe the startup
-     * merge against a non-empty "recorded while the load was in flight" state.
+     * Cancels the init load (it reads [settingsFile] at execution time) and any pending debounced
+     * save, then clears both flows. When [reload] is true the load is re-run so the state matches
+     * [testFile], and [recorded] is seeded after it, so a test can observe the startup merge
+     * against a non-empty "recorded while the load was in flight" state.
+     *
      * Tests must call this again with the real path before finishing, so the singleton is left
-     * where the app and other tests expect it.
+     * where the app and other tests expect it - and must pass `reload = false` when they do.
+     * Reloading against the real path reads the user's own recent-files.json, and a denormalised
+     * one (duplicate paths, over-cap, hand-edited order) makes the merge differ from the decoded
+     * contents, which schedules a save the rest of the suite easily outlives. The restore only
+     * needs the pointer back in place; nothing else in the suite drives this object.
      */
     internal suspend fun resetForTesting(
         testFile: File,
         recorded: List<RecentFile>? = null,
+        reload: Boolean = true,
     ) {
         initialLoadJob?.cancel()
         initialLoadJob = null
+        // Cancelled before the swap, not after: saveImmediately reads settingsFile without the
+        // lock, so a job already past its delay would write the just-cleared list to the new
+        // path - which on the restore call is the user's own file.
+        synchronized(saveJobLock) {
+            saveJob?.cancel()
+            saveJob = null
+        }
         mutationLock.withLock {
             settingsFile = testFile
             _allFiles.value = emptyList()
@@ -252,10 +265,7 @@ object RecentFilesManager {
         // Keep refreshVisible as the only writer of the displayed flow. This orders the reset
         // against a derive already holding visibilityLock without nesting the two locks.
         refreshVisible()
-        synchronized(saveJobLock) {
-            saveJob?.cancel()
-            saveJob = null
-        }
+        if (!reload) return
         loadAsync()
         if (recorded != null) {
             mutationLock.withLock { _allFiles.value = recorded }

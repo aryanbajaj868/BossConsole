@@ -47,7 +47,10 @@ class RecentFilesLoadTest {
         runBlocking {
             // Point the singleton back at the user's file and reload, so tests that run after
             // this class observe the same state the app would.
-            RecentFilesManager.resetForTesting(BossDirectories.resolve("recent-files.json"))
+            RecentFilesManager.resetForTesting(
+                BossDirectories.resolve("recent-files.json"),
+                reload = false,
+            )
             tempFile.delete()
         }
         workDir.deleteRecursively()
