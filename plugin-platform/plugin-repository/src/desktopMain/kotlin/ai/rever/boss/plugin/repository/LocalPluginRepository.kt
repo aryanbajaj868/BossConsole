@@ -179,7 +179,7 @@ class LocalPluginRepository(
                     jar.getJarEntry(PluginManifestConstants.MANIFEST_PATH)
                         ?: return null
 
-                val content = jar.getInputStream(manifestEntry).bufferedReader().readText()
+                val content = jar.getInputStream(manifestEntry).readBoundedText()
                 val manifest = json.decodeFromString<PluginManifest>(content)
 
                 PluginInfo(
@@ -221,7 +221,7 @@ class LocalPluginRepository(
                     jar.getJarEntry(PluginManifestConstants.MANIFEST_PATH)
                         ?: return null
 
-                val content = jar.getInputStream(manifestEntry).bufferedReader().readText()
+                val content = jar.getInputStream(manifestEntry).readBoundedText()
                 val manifest = json.decodeFromString<PluginManifest>(content)
                 manifest.pluginId
             }
