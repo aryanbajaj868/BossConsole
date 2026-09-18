@@ -45,8 +45,8 @@ class RecentFilesLoadTest {
     @AfterTest
     fun tearDown() {
         runBlocking {
-            // Point the singleton back at the user's file and reload, so tests that run after
-            // this class observe the same state the app would.
+            // Restore the singleton's ordinary task-local path without starting work that can
+            // outlive this test. The Test task redirects user.home away from the developer's home.
             RecentFilesManager.resetForTesting(
                 BossDirectories.resolve("recent-files.json"),
                 reload = false,
