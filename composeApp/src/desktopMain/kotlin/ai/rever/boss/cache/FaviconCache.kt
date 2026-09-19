@@ -10,6 +10,10 @@ import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.toAwtImage
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 import java.security.MessageDigest
 import javax.imageio.ImageIO
@@ -25,12 +29,21 @@ object FaviconCache {
 
     private const val STALE_AFTER_DAYS = 30
 
+    // Off-thread home for the once-per-process sweep. The first touch of cacheDir can be the UI
+    // thread - workspace restore loads cached favicons while it builds tabs - and a directory
+    // listing plus per-file mtime reads and deletes has no business there. SupervisorJob so a
+    // failed sweep can never poison the scope for a future launch.
+    private val sweepScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     private val cacheDir: File by lazy {
         val appCacheDir = BossDirectories.resolve("cache/$CACHE_DIR_NAME")
         appCacheDir.mkdirs()
         // The only thing that ever ages this cache out. Once per process, on first use: nothing
-        // else calls cleanupStaleEntries, so without this the directory only ever grows.
-        cleanupStaleEntries(STALE_AFTER_DAYS, appCacheDir)
+        // else calls cleanupStaleEntries, so without this the directory only ever grows. Launched
+        // rather than run inline so the first touch does not pay for it. Racing a concurrent save
+        // is safe: the sweep reads each file's mtime right before deleting it and a fresh write
+        // has a fresh mtime, so the worst case is one re-fetch of an icon written the same instant.
+        sweepScope.launch { cleanupStaleEntries(STALE_AFTER_DAYS, appCacheDir) }
         appCacheDir
     }
 
