@@ -52,7 +52,10 @@ class TerminalLimitsTest {
             queued.add(block)
         }
 
-        fun next(): Runnable = checkNotNull(queued.poll(5, TimeUnit.SECONDS)) { "Expected a dispatched continuation" }
+        fun next(
+            timeout: Long = 5,
+            unit: TimeUnit = TimeUnit.SECONDS,
+        ): Runnable = checkNotNull(queued.poll(timeout, unit)) { "Expected a dispatched continuation" }
     }
 
     private val root = Files.createTempDirectory("terminal-limits-")
@@ -229,12 +232,18 @@ class TerminalLimitsTest {
     @Test
     fun `cancellation during return dispatch terminates the unclaimed process`() =
         runBlocking {
-            withTimeout(15_000) {
+            // 30 s of fixture startup plus the usual 15 s lifecycle budget: the return dispatch below is
+            // only queued once the child JVM has launched, and the poll it waits on is blocking, so the
+            // outer deadline has to cover it rather than race it.
+            withTimeout(45_000) {
                 val dispatcher = PausedDispatcher()
                 val scope = CoroutineScope(SupervisorJob() + dispatcher + callerContext)
                 val creation = scope.async { service.createSession(request("wait")) }
                 dispatcher.next().run()
-                val returning = dispatcher.next()
+                // JVM fixture startup is not the lifecycle deadline, especially on a busy Windows runner
+                // (same split as the `background` test): this continuation arrives after the cold child
+                // JVM is up, so give it the startup budget, not the 5 s every other dispatch gets.
+                val returning = dispatcher.next(timeout = 30, unit = TimeUnit.SECONDS)
                 val unclaimed =
                     stub
                         .listSessions(Empty.getDefaultInstance())
