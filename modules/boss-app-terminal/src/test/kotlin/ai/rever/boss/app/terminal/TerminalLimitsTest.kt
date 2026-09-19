@@ -59,9 +59,14 @@ class TerminalLimitsTest {
         suspend fun next(
             timeout: Long = 5,
             unit: TimeUnit = TimeUnit.SECONDS,
+            label: String = "continuation",
         ): Runnable =
             runInterruptible {
-                checkNotNull(queued.poll(timeout, unit)) { "Expected a dispatched continuation" }
+                val started = System.nanoTime()
+                checkNotNull(queued.poll(timeout, unit)) {
+                    val waitedMs = (System.nanoTime() - started) / 1_000_000
+                    "Expected the $label to be dispatched within $timeout $unit (waited ${waitedMs}ms, queue empty)"
+                }
             }
     }
 
@@ -246,11 +251,11 @@ class TerminalLimitsTest {
                 val dispatcher = PausedDispatcher()
                 val scope = CoroutineScope(SupervisorJob() + dispatcher + callerContext)
                 val creation = scope.async { service.createSession(request("wait")) }
-                dispatcher.next().run()
+                dispatcher.next(label = "async start").run()
                 // JVM fixture startup is not the lifecycle deadline, especially on a busy Windows runner
                 // (same split as the `background` test): this continuation arrives after the cold child
                 // JVM is up, so give it the startup budget, not the 5 s every other dispatch gets.
-                val returning = dispatcher.next(timeout = 30, unit = TimeUnit.SECONDS)
+                val returning = dispatcher.next(timeout = 30, unit = TimeUnit.SECONDS, label = "return dispatch")
                 val unclaimed =
                     stub
                         .listSessions(Empty.getDefaultInstance())
