@@ -28,6 +28,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.nio.file.Files
@@ -52,10 +53,16 @@ class TerminalLimitsTest {
             queued.add(block)
         }
 
-        fun next(
+        // runInterruptible so a withTimeout around the caller actually applies to this poll:
+        // cancellation cannot interrupt a bare BlockingQueue.poll, only a thread interrupt can,
+        // and without this the outer deadline only fired once the poll had already returned.
+        suspend fun next(
             timeout: Long = 5,
             unit: TimeUnit = TimeUnit.SECONDS,
-        ): Runnable = checkNotNull(queued.poll(timeout, unit)) { "Expected a dispatched continuation" }
+        ): Runnable =
+            runInterruptible {
+                checkNotNull(queued.poll(timeout, unit)) { "Expected a dispatched continuation" }
+            }
     }
 
     private val root = Files.createTempDirectory("terminal-limits-")
