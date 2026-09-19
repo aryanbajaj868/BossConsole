@@ -23,9 +23,14 @@ object FaviconCache {
     private const val MAX_FAVICON_SIZE_BYTES = 100 * 1024 // 100KB limit
     private const val CACHE_DIR_NAME = "favicon-cache"
 
+    private const val STALE_AFTER_DAYS = 30
+
     private val cacheDir: File by lazy {
         val appCacheDir = BossDirectories.resolve("cache/$CACHE_DIR_NAME")
         appCacheDir.mkdirs()
+        // The only thing that ever ages this cache out. Once per process, on first use: nothing
+        // else calls cleanupStaleEntries, so without this the directory only ever grows.
+        cleanupStaleEntries(STALE_AFTER_DAYS, appCacheDir)
         appCacheDir
     }
 
@@ -182,21 +187,27 @@ object FaviconCache {
     /**
      * Removes stale cache entries older than the specified number of days.
      * @param daysOld Remove files older than this many days (default: 30)
+     * @param dir The directory to sweep. Explicit only from the [cacheDir] initializer (which
+     *   cannot read [cacheDir] yet) and from tests.
+     * @return the number of entries removed
      */
-    fun cleanupStaleEntries(daysOld: Int = 30) {
+    fun cleanupStaleEntries(
+        daysOld: Int = STALE_AFTER_DAYS,
+        dir: File = cacheDir,
+    ): Int {
+        var removedCount = 0
         try {
             val cutoffTime = System.currentTimeMillis() - (daysOld * 24 * 60 * 60 * 1000L)
-            var removedCount = 0
 
-            cacheDir.listFiles()?.forEach { file ->
-                if (file.lastModified() < cutoffTime) {
-                    file.delete()
+            dir.listFiles()?.forEach { file ->
+                if (file.lastModified() < cutoffTime && file.delete()) {
                     removedCount++
                 }
             }
         } catch (e: Exception) {
             logger.warn(LogCategory.BROWSER, "Error cleaning up cache", error = e)
         }
+        return removedCount
     }
 
     /**
