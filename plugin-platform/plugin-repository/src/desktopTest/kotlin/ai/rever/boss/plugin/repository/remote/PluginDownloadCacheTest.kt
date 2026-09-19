@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.repository.remote
 
+import kotlinx.coroutines.Dispatchers
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -135,7 +136,7 @@ class PluginDownloadCacheTest {
         Files.setLastModifiedTime(stale.toPath(), fortyDaysAgo)
         Files.setLastModifiedTime(staleMetadata, fortyDaysAgo)
 
-        val cache = PluginDownloadCache(root)
+        val cache = PluginDownloadCache(root, sweepDispatcher = Dispatchers.Unconfined)
 
         assertFalse(stale.exists(), "version past the window should be swept at construction")
         assertFalse(Files.exists(staleMetadata))
@@ -148,7 +149,7 @@ class PluginDownloadCacheTest {
         val notADirectory = File(temporary, "cache").also { it.writeText("in the way") }
         // Must not throw: the startup sweep fails the same way any later use will, and
         // construction is required to survive that.
-        val cache = PluginDownloadCache(notADirectory)
+        val cache = PluginDownloadCache(notADirectory, sweepDispatcher = Dispatchers.Unconfined)
         assertFailsWith<Exception> { cache.getCachedFileCount() }
         assertEquals("in the way", notADirectory.readText())
     }
