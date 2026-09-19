@@ -33,6 +33,16 @@ class PluginDownloadCache(
     private val root: Path get() = location.getOrThrow().first
     private val rootIdentity: Any? get() = location.getOrThrow().second
 
+    init {
+        // The only age-based eviction this cache has, and nothing else calls it: without this
+        // every version ever downloaded stays on disk. Once per process, at construction. The
+        // sweep goes through entries() and so inherits checkRoot(); a failure is logged and
+        // swallowed for the same reason `location` retains its own - an unusable cache must not
+        // prevent repository construction.
+        runCatching { cleanOldEntries() }
+            .onFailure { logger.warn(LogCategory.SYSTEM, "Skipped plugin cache expiry at startup", error = it) }
+    }
+
     @Serializable
     private data class CacheMetadata(
         val pluginId: String,
